@@ -1,4 +1,5 @@
-# Flask DevOps Pipeline — Python → Docker → Jenkins → Terraform → AWS EC2
+# Flask DevOps Pipeline —
+Python → Docker → Jenkins → Terraform → AWS EC2
 
 A complete, automated path from source code to a running server on the internet: a
 Python/Flask application that is tested, containerised with Docker, built and deployed

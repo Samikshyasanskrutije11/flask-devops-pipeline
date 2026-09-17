@@ -1,0 +1,6 @@
+aws_region       = "ap-south-1"
+project_name     = "flask-devops"
+instance_type    = "t2.micro"
+key_name         = "my-ec2-keypair"   # existing key pair name in that region
+ssh_allowed_cidr = "0.0.0.0/0"        # tighten to YOUR_IP/32
+environment      = "production"

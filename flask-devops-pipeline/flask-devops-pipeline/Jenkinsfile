@@ -1,0 +1,153 @@
+pipeline {
+    agent any
+
+    environment {
+        DOCKERHUB_USER  = 'your-dockerhub-username'          // <-- change me
+        IMAGE_NAME      = "${DOCKERHUB_USER}/flask-devops-pipeline"
+        IMAGE_TAG       = "${env.BUILD_NUMBER}"
+        AWS_REGION      = 'ap-south-1'
+        TF_IN_AUTOMATION = 'true'
+    }
+
+    options {
+        timestamps()
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 30, unit: 'MINUTES')
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+                sh 'git log -1 --oneline'
+            }
+        }
+
+        stage('Install & Test') {
+            steps {
+                sh '''
+                    python3 -m venv venv
+                    . venv/bin/activate
+                    pip install --upgrade pip
+                    pip install -r app/requirements-dev.txt
+                    flake8 app tests
+                    pytest tests -v --junitxml=report.xml
+                '''
+            }
+            post {
+                always { junit allowEmptyResults: true, testResults: 'report.xml' }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                sh '''
+                    docker build \
+                      --build-arg APP_VERSION=${IMAGE_TAG} \
+                      -t ${IMAGE_NAME}:${IMAGE_TAG} \
+                      -t ${IMAGE_NAME}:latest .
+                '''
+            }
+        }
+
+        stage('Smoke Test Image') {
+            steps {
+                sh '''
+                    docker rm -f smoke-test || true
+                    docker run -d --name smoke-test -p 5001:5000 ${IMAGE_NAME}:${IMAGE_TAG}
+                    for i in $(seq 1 15); do
+                        if curl -fs http://localhost:5001/health; then echo "OK"; break; fi
+                        sleep 2
+                    done
+                    curl -fs http://localhost:5001/health
+                '''
+            }
+            post {
+                always { sh 'docker rm -f smoke-test || true' }
+            }
+        }
+
+        stage('Push to Docker Hub') {
+            steps {
+                withCredentials([usernamePassword(
+                        credentialsId: 'dockerhub-creds',
+                        usernameVariable: 'DH_USER',
+                        passwordVariable: 'DH_PASS')]) {
+                    sh '''
+                        echo "$DH_PASS" | docker login -u "$DH_USER" --password-stdin
+                        docker push ${IMAGE_NAME}:${IMAGE_TAG}
+                        docker push ${IMAGE_NAME}:latest
+                        docker logout
+                    '''
+                }
+            }
+        }
+
+        stage('Terraform Provision (AWS EC2)') {
+            steps {
+                withCredentials([
+                    string(credentialsId: 'aws-access-key-id',     variable: 'AWS_ACCESS_KEY_ID'),
+                    string(credentialsId: 'aws-secret-access-key', variable: 'AWS_SECRET_ACCESS_KEY')
+                ]) {
+                    dir('terraform') {
+                        sh '''
+                            terraform init -input=false
+                            terraform validate
+                            terraform plan -input=false -out=tfplan
+                            terraform apply -input=false -auto-approve tfplan
+                            terraform output -raw instance_public_ip > ../ec2_ip.txt
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Deploy to EC2') {
+            steps {
+                withCredentials([
+                    sshUserPrivateKey(credentialsId: 'ec2-ssh-key',
+                                      keyFileVariable: 'SSH_KEY',
+                                      usernameVariable: 'SSH_USER')
+                ]) {
+                    sh '''
+                        EC2_IP=$(cat ec2_ip.txt)
+                        echo "Deploying ${IMAGE_NAME}:${IMAGE_TAG} to ${EC2_IP}"
+
+                        ssh -o StrictHostKeyChecking=no -i "$SSH_KEY" ${SSH_USER}@${EC2_IP} "
+                            sudo docker pull ${IMAGE_NAME}:${IMAGE_TAG} &&
+                            sudo docker rm -f flask-app || true &&
+                            sudo docker run -d --name flask-app --restart unless-stopped \
+                                -p 80:5000 \
+                                -e ENVIRONMENT=production \
+                                ${IMAGE_NAME}:${IMAGE_TAG} &&
+                            sudo docker image prune -f
+                        "
+                    '''
+                }
+            }
+        }
+
+        stage('Verify Deployment') {
+            steps {
+                sh '''
+                    EC2_IP=$(cat ec2_ip.txt)
+                    for i in $(seq 1 20); do
+                        if curl -fs http://${EC2_IP}/health; then
+                            echo "Deployment verified at http://${EC2_IP}"
+                            exit 0
+                        fi
+                        sleep 5
+                    done
+                    echo "App did not become healthy in time"; exit 1
+                '''
+            }
+        }
+    }
+
+    post {
+        success { echo "Build ${IMAGE_TAG} deployed successfully." }
+        failure { echo "Build ${IMAGE_TAG} failed - check the stage logs above." }
+        always  { sh 'docker image prune -f || true' }
+    }
+}

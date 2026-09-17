@@ -1,0 +1,13 @@
+services:
+  web:
+    build:
+      context: .
+      args:
+        APP_VERSION: local-dev
+    image: flask-devops-pipeline:local
+    container_name: flask-devops-app
+    ports:
+      - "5000:5000"
+    environment:
+      ENVIRONMENT: local
+    restart: unless-stopped
